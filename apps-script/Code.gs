@@ -9,9 +9,13 @@
  *   4. Implantar → Nova implantação → App da Web
  *      Executar como: Eu · Quem pode acessar: Qualquer pessoa → copiar a URL /exec.
  *
+ *   5. Rodar a função  instalarRotinaDiaria  e autorizar (e-mail + gatilho).
+ *      Todo dia às 8h: grava uma linha na aba HISTÓRICO e envia o resumo por e-mail.
+ *      Destinatário: a propriedade EMAIL_RESUMO (vários separados por vírgula) ou, sem ela, o seu e-mail.
+ *
  * Ao mudar este código: Implantar → Gerenciar implantações → editar → Nova versão.
  *
- * GET <url>/exec?token=SENHA  →  { ok, gerado, produtos, vendas, compras, metas, ... }
+ * GET <url>/exec?token=SENHA  →  { ok, gerado, produtos, vendas, compras, metas, evolucao, snapshots, ... }
  */
 
 var ABA_CADASTRO = 'CADASTRO E CONTROLE';
@@ -19,7 +23,13 @@ var ABA_SAIDAS   = 'SAÍDAS';
 var ABA_ENTRADAS = 'ENTRADAS';
 var ABA_PRECOS   = 'PREÇOS';
 var ABA_METAS    = 'METAS';
+var ABA_HIST     = 'HISTÓRICO';
 var FUSO         = 'America/Sao_Paulo';
+var URL_PAINEL   = 'https://anavrodovalho.github.io/ritz-painel/';
+var DIAS_PARADO  = 45;   // sem venda há X dias (ou, se nunca vendeu, desde a 1ª entrada)
+
+var HIST_COLUNAS = ['data', 'valor_estoque', 'pecas_estoque', 'itens_abaixo_minimo', 'itens_parados',
+  'receita_mes', 'lucro_mes', 'pedidos_mes', 'caixa_atual'];
 
 // brindes (preço 0) das sócias ficam fora dos números de cliente/venda
 var SOCIAS = ['ana laura rodovalho', 'rafaella rempel', 'rafaela rempel'];
@@ -73,11 +83,12 @@ function montarDados_() {
   });
 
   // vendas (SAÍDAS) — a coluna "Pedido" guarda o nome da cliente
-  var vendas = [], brindes = 0, precosVendidos = {};
+  var vendas = [], brindes = 0, precosVendidos = {}, saidas = [];
   sai.linhas.forEach(function (r) {
     var sku = txt_(r[sai.col['Cod. Item']]), data = data_(r[sai.col['Data']]);
     if (!sku || !data) return;
     var qtd = num_(r[sai.col['Quantidade']]) || 1, preco = num_(r[sai.col['Preço Venda']]);
+    saidas.push({ data: data, sku: sku, qtd: qtd });   // inclui brindes: também tiram peça do estoque
     var cliente = txt_(r[sai.col['Pedido']]);
     var receita = num_(r[sai.col['Total Vendido']]) || preco * qtd;
     if (receita === 0 && SOCIAS.indexOf(cliente.toLowerCase()) >= 0) { brindes++; return; }
@@ -95,9 +106,13 @@ function montarDados_() {
   }
 
   // produtos (CADASTRO E CONTROLE)
-  var produtos = [];
-  cad.linhas.forEach(function (r) {
+  // SKU cadastrado em duas linhas: as duas mostram o mesmo saldo (SUMIF), então conta só a primeira
+  var produtos = [], linhaDoSku = {}, duplicados = [];
+  cad.linhas.forEach(function (r, i) {
     var sku = txt_(r[cad.col['Cod. Item']]); if (!sku) return;
+    var linha = cad.inicio + i;
+    if (linhaDoSku[sku]) { duplicados.push({ sku: sku, linhas: [linhaDoSku[sku], linha] }); return; }
+    linhaDoSku[sku] = linha;
     var partes = sku.split('-'), tam = '', cor = '';
     var nome = txt_(r[cad.col['Descrição do Item']]);
     // código conhecido manda (agrupa variações de escrita); senão vale a cor escrita na descrição "… (Cor) (Tam)"
@@ -115,7 +130,39 @@ function montarDados_() {
   });
 
   return { ok: true, gerado: new Date().toISOString(), produtos: produtos, vendas: vendas, compras: compras,
-    pedidos: [], leads: [], campanhas: [], metas: lerMetas_(ss), snapshots: [], brindes_excluidos: brindes };
+    pedidos: [], leads: [], campanhas: [], metas: lerMetas_(ss), snapshots: lerHistorico_(ss),
+    evolucao: evolucaoEstoque_(produtos, compras, saidas), brindes_excluidos: brindes, duplicados: duplicados };
+}
+
+/**
+ * Estoque dia a dia desde o 1º movimento, reconstruído de trás pra frente a partir do saldo de hoje
+ * (saldo de ontem = hoje − entradas de hoje + saídas de hoje). Valor a custo atual de cada SKU.
+ */
+function evolucaoEstoque_(produtos, compras, saidas) {
+  var custo = {}, pecas = 0, valor = 0;
+  produtos.forEach(function (p) { custo[p.sku] = p.custo_unitario; pecas += p.estoque_atual; valor += p.estoque_atual * p.custo_unitario; });
+  var mov = {};  // data → {p: Δpeças, v: Δvalor}
+  function add(d, sku, q) { if (!d) return; var m = mov[d] = mov[d] || { p: 0, v: 0 }; m.p += q; m.v += q * (custo[sku] || 0); }
+  compras.forEach(function (c) { add(c.data, c.sku, c.qtd); });
+  saidas.forEach(function (s) { add(s.data, s.sku, -s.qtd); });
+  var datas = Object.keys(mov).sort(); if (!datas.length) return [];
+  var hoje = Utilities.formatDate(new Date(), FUSO, 'yyyy-MM-dd'), out = [];
+  var d = new Date(hoje + 'T12:00:00Z'), ini = new Date(datas[0] + 'T12:00:00Z');
+  while (d >= ini) {
+    var k = d.toISOString().slice(0, 10);
+    out.push({ data: k, pecas: Math.round(pecas), valor: Math.round(valor * 100) / 100 });
+    if (mov[k]) { pecas -= mov[k].p; valor -= mov[k].v; }
+    d.setUTCDate(d.getUTCDate() - 1);
+  }
+  return out.reverse();
+}
+
+function lerHistorico_(ss) {
+  var sh = ss.getSheetByName(ABA_HIST); if (!sh || sh.getLastRow() < 2) return [];
+  var v = sh.getDataRange().getValues(), h = v[0].map(function (c) { return txt_(c); });
+  return v.slice(1).filter(function (r) { return r[0] !== ''; }).map(function (r) {
+    var o = {}; h.forEach(function (k, j) { o[k] = k === 'data' ? data_(r[j]) : num_(r[j]); }); return o;
+  });
 }
 
 /** Lê uma aba achando a linha de cabeçalho pela célula "Cod. Item" (nunca pela posição). */
@@ -129,7 +176,7 @@ function tabela_(ss, nome) {
   if (h < 0) throw new Error('Cabeçalho "Cod. Item" não encontrado na aba ' + nome);
   var col = {};
   v[h].forEach(function (c, j) { var k = String(c).trim(); if (k && !(k in col)) col[k] = j; });
-  return { col: col, linhas: v.slice(h + 1) };
+  return { col: col, linhas: v.slice(h + 1), inicio: h + 2 };   // inicio = nº da linha na planilha do 1º dado
 }
 
 function lerMetas_(ss) {
@@ -153,7 +200,9 @@ function num_(v) {
 function data_(v) {
   if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, FUSO, 'yyyy-MM-dd');
   if (typeof v === 'number' && v > 20000) return Utilities.formatDate(new Date(Date.UTC(1899, 11, 30) + Math.round(v) * 864e5), 'UTC', 'yyyy-MM-dd');
-  var m = String(v || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  var s = String(v || '').trim(), iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return iso[0];
+  var m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
   if (m) { var y = m[3].length === 2 ? '20' + m[3] : m[3]; return y + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2); }
   return null;
 }
@@ -227,6 +276,142 @@ function colLetra_(n) { var s = ''; while (n > 0) { var m = (n - 1) % 26; s = St
 /** Teste rápido no editor: mostra no log quantos registros o painel vai receber. */
 function testarLeitura() {
   var d = montarDados_();
-  Logger.log('produtos %s · vendas %s · compras %s · metas %s · brindes excluídos %s',
-    d.produtos.length, d.vendas.length, d.compras.length, d.metas.length, d.brindes_excluidos);
+  Logger.log('produtos %s · vendas %s · compras %s · metas %s · histórico %s · evolução %s dias · brindes excluídos %s',
+    d.produtos.length, d.vendas.length, d.compras.length, d.metas.length, d.snapshots.length, d.evolucao.length, d.brindes_excluidos);
+}
+
+/* ======================= Rotina diária: histórico + e-mail ======================= */
+
+/** Rodar uma vez: cria o gatilho diário das 8h e já grava a primeira linha do histórico. */
+function instalarRotinaDiaria() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'rotinaDiaria') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('rotinaDiaria').timeBased().everyDays(1).atHour(8).inTimezone(FUSO).create();
+  registrarHistorico();
+  Logger.log('Rotina diária instalada (8h). E-mail vai para: %s', destinatarios_());
+}
+
+/** Para desligar o e-mail e o histórico automáticos. */
+function desinstalarRotinaDiaria() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'rotinaDiaria') ScriptApp.deleteTrigger(t);
+  });
+}
+
+function rotinaDiaria() {
+  var d = montarDados_();
+  registrarHistorico(d);
+  enviarResumoDiario(d);
+}
+
+/** Grava (ou atualiza) a linha de hoje na aba HISTÓRICO. */
+function registrarHistorico(d) {
+  d = d || montarDados_();
+  var ss = SpreadsheetApp.getActiveSpreadsheet(), sh = ss.getSheetByName(ABA_HIST);
+  if (!sh) {
+    sh = ss.insertSheet(ABA_HIST);
+    sh.getRange(1, 1, 1, HIST_COLUNAS.length).setValues([HIST_COLUNAS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  var r = resumo_(d), hoje = r.hoje;
+  var linha = [hoje, r.valorEstoque, r.pecas, r.abaixo.length, r.parados.length,
+    r.mes.receita, r.mes.lucro, r.mes.pedidos, r.metas.caixa_atual != null ? r.metas.caixa_atual : ''];
+  var datas = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().map(function (x) { return data_(x[0]); }) : [];
+  var i = datas.indexOf(hoje);
+  var alvo = i >= 0 ? i + 2 : sh.getLastRow() + 1;
+  sh.getRange(alvo, 1, 1, linha.length).setValues([linha]);
+  sh.getRange(alvo, 1).setNumberFormat('@');   // data como texto aaaa-mm-dd, sem conversão de fuso
+}
+
+/** Resumo por e-mail: vendas de ontem, mês x metas, reposição e parados. */
+function enviarResumoDiario(d) {
+  d = d || montarDados_();
+  var r = resumo_(d), m = r.metas;
+  var brl = function (v) { return 'R$ ' + Number(v || 0).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
+  var pct = function (v) { return Math.round(v) + '%'; };
+  var linha = function (rot, val, extra) {
+    return '<tr><td style="padding:6px 0;color:#555">' + rot + '</td><td style="padding:6px 0;text-align:right;font-weight:600">' + val +
+      (extra ? '<div style="font-weight:400;color:#888;font-size:12px">' + extra + '</div>' : '') + '</td></tr>';
+  };
+  var meta = function (atual, alvo, fmt) { return alvo > 0 ? 'meta ' + fmt(alvo) + ' · ' + pct(atual / alvo * 100) : ''; };
+  var esc = function (s) { return String(s).replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; }); };
+
+  var ontemTxt = r.ontem.itens.length
+    ? r.ontem.itens.map(function (v) { return '• ' + esc(v.nome) + ' — ' + esc(v.cliente || '—') + ' — ' + brl(v.receita); }).join('<br>')
+    : 'Nenhuma venda lançada ontem.';
+  var lista = function (arr, fmt) {
+    if (!arr.length) return '<p style="color:#888;margin:4px 0;font-size:13px">Nada por aqui ✓</p>';
+    var mais = arr.length > 12 ? '<br>… e mais ' + (arr.length - 12) : '';
+    return '<p style="margin:4px 0;line-height:1.6;font-size:13px">' + arr.slice(0, 12).map(fmt).join('<br>') + mais + '</p>';
+  };
+
+  var html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;color:#111">' +
+    '<div style="letter-spacing:.4em;font-size:22px;font-weight:300;margin:8px 0 2px">RITZ</div>' +
+    '<div style="color:#888;font-size:12px;margin-bottom:18px">Resumo de ' + r.hojeBR + '</div>' +
+    '<h3 style="font-size:15px;margin:16px 0 6px">Ontem</h3>' +
+    '<table style="width:100%;border-collapse:collapse;font-size:14px">' +
+      linha('Receita', brl(r.ontem.receita)) + linha('Pedidos', r.ontem.pedidos) + '</table>' +
+    '<p style="font-size:13px;line-height:1.6;color:#333">' + ontemTxt + '</p>' +
+    '<h3 style="font-size:15px;margin:18px 0 6px">Mês até agora</h3>' +
+    '<table style="width:100%;border-collapse:collapse;font-size:14px">' +
+      linha('Receita', brl(r.mes.receita), meta(r.mes.receita, m.meta_receita_mensal, brl)) +
+      linha('Lucro', brl(r.mes.lucro)) +
+      linha('Margem', pct(r.mes.margem), m.margem_alvo_pct > 0 ? 'meta ' + pct(m.margem_alvo_pct) : '') +
+      linha('Pedidos', r.mes.pedidos, meta(r.mes.pedidos, m.meta_pedidos_mensal, String)) +
+      (m.caixa_atual != null ? linha('Caixa informado', brl(m.caixa_atual), m.caixa_minimo > 0 ? 'mínimo ' + brl(m.caixa_minimo) : '') : '') +
+    '</table>' +
+    (d.duplicados.length ? '<p style="background:#fdecea;border-radius:8px;padding:10px 12px;font-size:13px;color:#8a1c14;line-height:1.6">' +
+      '<b>Cadastro duplicado (' + d.duplicados.length + ')</b> — cada SKU deve aparecer uma vez em ' + ABA_CADASTRO + ':<br>' +
+      d.duplicados.map(function (x) { return '• ' + x.sku + ' nas linhas ' + x.linhas.join(' e '); }).join('<br>') + '</p>' : '') +
+    '<h3 style="font-size:15px;margin:18px 0 6px">Repor (' + r.abaixo.length + ' abaixo do mínimo)</h3>' +
+    lista(r.abaixo, function (p) { return '• ' + esc(p.nome) + ' — tem ' + p.estoque_atual + ', mínimo ' + p.estoque_minimo; }) +
+    '<h3 style="font-size:15px;margin:18px 0 6px">Parados há ' + DIAS_PARADO + '+ dias (' + r.parados.length + ' itens · ' + brl(r.valorParado) + ' a custo)</h3>' +
+    lista(r.parados, function (p) { return '• ' + esc(p.nome) + ' — ' + p.dias + ' dias, ' + p.estoque_atual + ' peça(s)'; }) +
+    '<p style="margin:22px 0"><a href="' + URL_PAINEL + '" style="background:#111;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none;font-size:14px">Abrir o painel</a></p>' +
+    '<p style="color:#aaa;font-size:11px">Estoque: ' + r.pecas + ' peças · ' + brl(r.valorEstoque) + ' a custo. Enviado automaticamente pelo Apps Script da planilha.</p></div>';
+
+  MailApp.sendEmail({ to: destinatarios_(), subject: 'RITZ · resumo de ' + r.hojeBR + ' — ontem ' + brl(r.ontem.receita), htmlBody: html });
+}
+
+function destinatarios_() {
+  return PropertiesService.getScriptProperties().getProperty('EMAIL_RESUMO') || Session.getEffectiveUser().getEmail();
+}
+
+/** Números do dia, compartilhados entre o e-mail e o histórico. */
+function resumo_(d) {
+  var agora = new Date(), hoje = Utilities.formatDate(agora, FUSO, 'yyyy-MM-dd');
+  var ontem = Utilities.formatDate(new Date(agora.getTime() - 864e5), FUSO, 'yyyy-MM-dd');
+  var ini = hoje.slice(0, 8) + '01';
+  var custo = {}; d.produtos.forEach(function (p) { custo[p.sku] = p.custo_unitario; });
+  var soma = function (vs) {
+    var rec = 0, cst = 0, ped = {};
+    vs.forEach(function (v) { rec += v.receita; cst += v.qtd * (custo[v.sku] || 0); ped[v.num_pedido] = 1; });
+    return { receita: rec, lucro: rec - cst, margem: rec > 0 ? (rec - cst) / rec * 100 : 0, pedidos: Object.keys(ped).length };
+  };
+  var vOntem = d.vendas.filter(function (v) { return v.data === ontem; });
+  var o = soma(vOntem); o.itens = vOntem;
+
+  // parado: dias desde a última venda; se nunca vendeu, desde a 1ª entrada
+  var ultVenda = {}, primEntrada = {};
+  d.vendas.forEach(function (v) { if (!ultVenda[v.sku] || v.data > ultVenda[v.sku]) ultVenda[v.sku] = v.data; });
+  d.compras.forEach(function (c) { if (c.data && (!primEntrada[c.sku] || c.data < primEntrada[c.sku])) primEntrada[c.sku] = c.data; });
+  var dias = function (iso) { return iso ? Math.floor((new Date(hoje) - new Date(iso)) / 864e5) : null; };
+  var parados = [], valorParado = 0;
+  d.produtos.forEach(function (p) {
+    if (p.estoque_atual <= 0) return;
+    var n = dias(ultVenda[p.sku] || primEntrada[p.sku]);
+    if (n != null && n >= DIAS_PARADO) { parados.push({ nome: p.nome, dias: n, estoque_atual: p.estoque_atual }); valorParado += p.estoque_atual * p.custo_unitario; }
+  });
+  parados.sort(function (a, b) { return b.dias - a.dias; });
+
+  return {
+    hoje: hoje, hojeBR: hoje.split('-').reverse().join('/'),
+    ontem: o, mes: soma(d.vendas.filter(function (v) { return v.data >= ini && v.data <= hoje; })),
+    metas: d.metas[0] || {},
+    abaixo: d.produtos.filter(function (p) { return p.estoque_minimo > 0 && p.estoque_atual < p.estoque_minimo; }),
+    parados: parados, valorParado: valorParado,
+    pecas: d.produtos.reduce(function (s, p) { return s + p.estoque_atual; }, 0),
+    valorEstoque: Math.round(d.produtos.reduce(function (s, p) { return s + p.estoque_atual * p.custo_unitario; }, 0) * 100) / 100
+  };
 }
